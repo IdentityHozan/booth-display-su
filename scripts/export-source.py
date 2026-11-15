@@ -2,13 +2,13 @@
 from pathlib import Path
 from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
 root = Path(__file__).resolve().parent.parent
-folders = ('app', 'lib', 'db', 'drizzle', 'worker', 'scripts', 'tests', 'public')
+folders = ('app', 'lib', 'scripts', 'tests', 'public')
 files = []
 for folder in folders:
     for p in (root / folder).rglob('*'):
         if p.is_file() and p.name != 'source.zip' and '__pycache__' not in p.parts:
             files.append(p)
-for name in ('package.json', 'pnpm-lock.yaml', 'tsconfig.json', 'vite.config.ts', 'next.config.ts', 'next.config.mjs', 'postcss.config.mjs', 'drizzle.config.ts', 'cloudflare-env.d.ts', 'next-env.d.ts', 'README.md', '.gitignore', '.openai/hosting.json'):
+for name in ('package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.json', 'next.config.ts', 'postcss.config.mjs', 'next-env.d.ts', 'README.md', '.env.example', '.gitignore', 'vercel.json'):
     p=root/name
     if p.is_file(): files.append(p)
 with ZipFile(root/'public/source.zip', 'w', compression=ZIP_DEFLATED) as archive:

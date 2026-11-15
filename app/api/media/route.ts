@@ -1,5 +1,41 @@
-import {env} from 'cloudflare:workers';
-export const dynamic='force-dynamic';
-export async function GET(r:Request){const key=new URL(r.url).searchParams.get('key');if(!key||!/^media\/[a-f0-9-]+$/.test(key))return new Response('Not found',{status:404});const o=await env.BUCKET!.get(key,{range:r.headers});if(!o)return new Response('Not found',{status:404});const h=new Headers();o.writeHttpMetadata(h);h.set('ETag',o.httpEtag);h.set('Accept-Ranges','bytes');h.set('Cache-Control','private, max-age=86400');h.set('X-Content-Type-Options','nosniff');if(o.range&&'offset'in o.range){const n=o.range.length||o.size;h.set('Content-Range',`bytes ${o.range.offset}-${(o.range.offset||0)+n-1}/${o.size}`);h.set('Content-Length',String(n));}else h.set('Content-Length',String(o.size));return new Response(o.body,{status:o.range?206:200,headers:h});}
-export async function POST(r:Request){if(r.headers.get('origin')!==new URL(r.url).origin)return new Response('Forbidden',{status:403});try{const body=await r.json() as any;const b=env.BUCKET!;if(body.action==='start'){if(!['video/mp4','video/webm','image/jpeg','image/png','image/webp'].includes(body.type))return new Response('Unsupported format',{status:400});const key='media/'+crypto.randomUUID();const upload=await b.createMultipartUpload(key,{httpMetadata:{contentType:body.type}});return Response.json({key,uploadId:upload.uploadId});}if(!/^media\/[a-f0-9-]+$/.test(body.key)||typeof body.uploadId!=='string')return new Response('Invalid upload',{status:400});const upload=b.resumeMultipartUpload(body.key,body.uploadId);if(body.action==='abort'){await upload.abort();return Response.json({ok:true});}if(body.action==='complete'){await upload.complete(body.parts);return Response.json({src:'/api/media?key='+encodeURIComponent(body.key)});}return new Response('Invalid action',{status:400});}catch{return new Response('Upload failed; please retry',{status:400});}}
-export async function PUT(r:Request){if(r.headers.get('origin')!==new URL(r.url).origin)return new Response('Forbidden',{status:403});const q=new URL(r.url).searchParams;const key=q.get('key')||'',id=q.get('uploadId')||'',part=Number(q.get('part'));if(!/^media\/[a-f0-9-]+$/.test(key)||!id||part<1||part>130||!r.body)return new Response('Invalid part',{status:400});const bytes=await r.arrayBuffer();if(bytes.byteLength>8*1024*1024)return new Response('Part too large',{status:413});try{return Response.json(await env.BUCKET!.resumeMultipartUpload(key,id).uploadPart(part,bytes));}catch{return new Response('Upload failed',{status:503});}}
+import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
+import { issueSignedToken, presignUrl } from '@vercel/blob';
+import { authenticated } from '../../../lib/auth';
+import { sameOrigin } from '../../../lib/session';
+import { mediaPath, mediaTypes, maxMediaBytes } from '../../../lib/media';
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+export async function GET(request: Request) {
+  if (!await authenticated()) return new Response('Please sign in.',{status:401});
+  const key = new URL(request.url).searchParams.get('key') || '';
+  if (!mediaPath.test(key)) return new Response('Media must be uploaded again after migrating from Cloudflare.',{status:404});
+  try {
+    const signed = await issueSignedToken({pathname:key,operations:['get'],validUntil:Date.now()+60*60*1000});
+    const {presignedUrl} = await presignUrl(signed,{pathname:key,operation:'get',access:'private'});
+    // The CDN serves bytes and range requests directly, avoiding function response limits.
+    return new Response(null,{status:307,headers:{Location:presignedUrl,'Cache-Control':'private, no-store','Referrer-Policy':'no-referrer'}});
+  } catch { return new Response('Media storage unavailable. Check the private Blob connection.',{status:503}); }
+}
+export async function POST(request: Request) {
+  try {
+    const raw = await request.text();
+    if (raw.length > 20000) return Response.json({error:'Request too large.'},{status:413});
+    const body = JSON.parse(raw) as HandleUploadBody;
+    if (body.type === 'blob.generate-client-token') {
+      if (!sameOrigin(request)) return Response.json({error:'Forbidden'},{status:403});
+      if (!await authenticated()) return Response.json({error:'Please sign in.'},{status:401});
+    } else if (body.type !== 'blob.upload-completed') {
+      return Response.json({error:'Invalid upload request.'},{status:400});
+    }
+    if (!process.env.BLOB_READ_WRITE_TOKEN) return Response.json({error:'Connect a private Vercel Blob store with BLOB_READ_WRITE_TOKEN.'},{status:503});
+    const result = await handleUpload({request,body,
+      onBeforeGenerateToken:async(pathname)=>{
+        if (!mediaPath.test(pathname)) throw new Error('Invalid media filename.');
+        return {allowedContentTypes:mediaTypes,maximumSizeInBytes:maxMediaBytes,addRandomSuffix:false,allowOverwrite:false,validUntil:Date.now()+60*60*1000};
+      },
+      // handleUpload verifies the Blob callback signature before invoking this.
+      onUploadCompleted:async()=>{},
+    });
+    return Response.json(result,{headers:{'Cache-Control':'no-store'}});
+  } catch { return Response.json({error:'Upload failed. Sign in again and check your Blob connection.'},{status:400}); }
+}
